@@ -16,6 +16,32 @@ function Log-Scan   { param($m) $m | Out-File -FilePath $ScanLog   -Append -Enco
 function Log-Remove { param($m) $m | Out-File -FilePath $RemoveLog -Append -Encoding utf8 }
 function Log-Error  { param($m) $m | Out-File -FilePath $ErrorLog  -Append -Encoding utf8 }
 
+function Test-MatchesAnyPattern {
+    param($Text,$Patterns)
+    if (-not $Text) { return $false }
+    foreach ($pattern in @($Patterns)) {
+        if ($Text -like $pattern) { return $true }
+    }
+    return $false
+}
+
+function Get-AdditionalDriveRoots {
+    $roots = @()
+    try {
+        $logicalDisks = Get-WmiObject Win32_LogicalDisk -Filter "DriveType = 2 OR DriveType = 3" -ErrorAction Stop
+        $roots = @($logicalDisks | Where-Object {
+            $_.DeviceID -and $_.DeviceID -ne $env:SystemDrive
+        } | ForEach-Object {
+            "{0}\" -f $_.DeviceID
+        })
+    } catch {
+        $roots = @(Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue | Where-Object {
+            $_.Root -match '^[A-Za-z]:\\$' -and $_.Root.TrimEnd('\') -ne $env:SystemDrive
+        } | ForEach-Object { $_.Root })
+    }
+    return @($roots | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -Unique)
+}
+
 function Split-UninstallString {
     param($u)
     if (-not $u) { return @{Exe=''; Args=$null} }
@@ -32,7 +58,8 @@ function Find-InstalledStrict {
     $results = @()
     $regPaths = @(
         'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
-        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall',
+        'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'
     )
     foreach ($rp in $regPaths) {
         Get-ChildItem $rp -ErrorAction SilentlyContinue | ForEach-Object {
@@ -58,18 +85,23 @@ function Find-InstalledStrict {
 function Stop-Kill-ServiceProcess {
     param($ServiceNames,$ProcessNames)
 
-    foreach ($s in $ServiceNames) {
-        $svc = Get-WmiObject Win32_Service -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq $s }
-        if ($svc) {
-            Write-Host "Stopping service $s (State: $($svc.State))..." -ForegroundColor DarkYellow
+    $allServices = @(Get-WmiObject Win32_Service -ErrorAction SilentlyContinue)
+    foreach ($servicePattern in @($ServiceNames)) {
+        $services = @($allServices | Where-Object {
+            (Test-MatchesAnyPattern -Text $_.Name -Patterns $servicePattern) -or
+            (Test-MatchesAnyPattern -Text $_.DisplayName -Patterns $servicePattern)
+        })
+        foreach ($svc in $services) {
+            $serviceName = $svc.Name
+            Write-Host "Stopping service $serviceName (State: $($svc.State))..." -ForegroundColor DarkYellow
             try {
-                sc.exe stop $s | Out-Null
+                sc.exe stop $serviceName | Out-Null
                 Start-Sleep -Seconds 2
-                sc.exe delete $s | Out-Null
-                Write-Host "Service $s stopped and removed." -ForegroundColor Green
+                sc.exe delete $serviceName | Out-Null
+                Write-Host "Service $serviceName stopped and removed." -ForegroundColor Green
             } catch {
-                Write-Host "Could not stop/remove service $s" -ForegroundColor Yellow
-                Log-Remove "Service $s could not be stopped/removed."
+                Write-Host "Could not stop/remove service $serviceName" -ForegroundColor Yellow
+                Log-Remove "Service $serviceName could not be stopped/removed."
             }
         }
     }
@@ -134,25 +166,82 @@ function Invoke-SmartUninstall {
 
 # --- Known products ---
 $KnownProducts = @(
-    @{Key='ScreenConnect'; DisplayNames=@('*ScreenConnect*','*ConnectWise Control*'); Procs=@('ScreenConnect.ClientService'); Svcs=@('ScreenConnect Client')},
-    @{Key='TeamViewer'; DisplayNames=@('*TeamViewer*'); Procs=@('TeamViewer','TeamViewer_Service'); Svcs=@('TeamViewer')},
-    @{Key='AnyDesk'; DisplayNames=@('*AnyDesk*'); Procs=@('AnyDesk'); Svcs=@('AnyDesk Service')},
-    @{Key='UltraViewer'; DisplayNames=@('*UltraViewer*'); Procs=@('UltraViewer'); Svcs=@()},
-    @{Key='LogMeIn'; DisplayNames=@('*LogMeIn*'); Procs=@('LogMeIn','LogMeInSystray','LogMeInMaintenanceService'); Svcs=@('LogMeIn','LMIGuardianSvc')},
-    @{Key='RescueCallingCard'; DisplayNames=@('*Rescue Calling Card*','*LogMeIn Rescue*','*LogMeIn Rescue Calling Card*'); Procs=@('RescueCallingCard','CallingCard'); Svcs=@('RescueCallingCard','LMIRfsClientNP')},
-    @{Key='VNC'; DisplayNames=@('*RealVNC*','*TightVNC*','*UltraVNC*','*VNC Server*','*VNC Viewer*'); Procs=@('vncserver','winvnc','tvnserver','vncviewer'); Svcs=@('VNC Server','WinVNC','uvnc_service','tvnserver')},
-    @{Key='Splashtop'; DisplayNames=@('*Splashtop*'); Procs=@('SRService','Splashtop'); Svcs=@('SplashtopRemoteService')},
-    @{Key='ZohoAssist'; DisplayNames=@('*Zoho*','*Zoho Corporation*','*Zoho Assist*'); Procs=@('Zoho','ZohoMeeting'); Svcs=@()},
-    @{Key='ChromeRemoteDesktop'; DisplayNames=@('*Chrome Remote Desktop*'); Procs=@('remoting_host'); Svcs=@('chromoting')}
+    @{Key='ScreenConnect'; DisplayNames=@('*ScreenConnect*','*ConnectWise Control*'); Procs=@('ScreenConnect.ClientService','ScreenConnect.WindowsClient'); Svcs=@('ScreenConnect Client*'); FilePatterns=@('*screenconnect*','*connectwise*control*')},
+    @{Key='TeamViewer'; DisplayNames=@('*TeamViewer*'); Procs=@('TeamViewer','TeamViewer_Service','TeamViewer_Desktop','TeamViewer_Note'); Svcs=@('TeamViewer*'); FilePatterns=@('*teamviewer*')},
+    @{Key='TeamRemoteDesktop'; DisplayNames=@('*Team Remote Desktop*'); Procs=@('TeamRemoteDesktop'); Svcs=@(); FilePatterns=@('*team*remote*desktop*')},
+    @{Key='AnyDesk'; DisplayNames=@('*AnyDesk*'); Procs=@('AnyDesk'); Svcs=@('AnyDesk*'); FilePatterns=@('*anydesk*')},
+    @{Key='RustDesk'; DisplayNames=@('*RustDesk*'); Procs=@('rustdesk','rustdesk_service'); Svcs=@('RustDesk*'); FilePatterns=@('*rustdesk*')},
+    @{Key='UltraViewer'; DisplayNames=@('*UltraViewer*'); Procs=@('UltraViewer','UltraViewer_Service'); Svcs=@('*UltraViewer*'); FilePatterns=@('*ultraviewer*')},
+    @{Key='LogMeIn'; DisplayNames=@('*LogMeIn*'); Procs=@('LogMeIn','LogMeInSystray','LogMeInMaintenanceService'); Svcs=@('LogMeIn*','LMIGuardianSvc*'); FilePatterns=@('*logmein*')},
+    @{Key='RescueCallingCard'; DisplayNames=@('*Rescue Calling Card*','*LogMeIn Rescue*','*GoTo Rescue Calling Card*'); Procs=@('RescueCallingCard','CallingCard'); Svcs=@('RescueCallingCard*','LMIRfsClientNP*'); FilePatterns=@('*rescue*calling*card*','*rescuecallingcard*')},
+    @{Key='GoToAssist'; DisplayNames=@('*GoToAssist*'); Procs=@('g2ax_comm_customer','g2ax_service','g2a_customer'); Svcs=@('GoToAssist*'); FilePatterns=@('*gotoassist*','*g2a_customer*')},
+    @{Key='GoToOpener'; DisplayNames=@('*GoTo Opener*'); Procs=@('GoTo Opener','g2mcomm'); Svcs=@('GoTo Opener*'); FilePatterns=@('*goto*opener*')},
+    @{Key='GoToResolve'; DisplayNames=@('*GoTo Resolve*'); Procs=@('GoToResolve','GoToResolveUnattended','GoToResolveAgent'); Svcs=@('GoTo Resolve*'); FilePatterns=@('*goto*resolve*')},
+    @{Key='RealVNC'; DisplayNames=@('*RealVNC*','*VNC Server*','*VNC Viewer*'); Procs=@('vncserver','vncviewer','vncserverui','vncagent'); Svcs=@('VNC Server*','vncserver*'); FilePatterns=@('*realvnc*','*vnc*server*','*vnc*viewer*')},
+    @{Key='TightVNC'; DisplayNames=@('*TightVNC*'); Procs=@('tvnserver','tvnviewer'); Svcs=@('tvnserver*','TightVNC*'); FilePatterns=@('*tightvnc*')},
+    @{Key='UltraVNC'; DisplayNames=@('*UltraVNC*'); Procs=@('winvnc','vncviewer'); Svcs=@('uvnc_service*','WinVNC*'); FilePatterns=@('*ultravnc*','*uvnc*')},
+    @{Key='TigerVNC'; DisplayNames=@('*TigerVNC*'); Procs=@('winvnc4','vncviewer64'); Svcs=@('TigerVNC*'); FilePatterns=@('*tigervnc*')},
+    @{Key='Splashtop'; DisplayNames=@('*Splashtop*'); Procs=@('SRService','Splashtop','SplashtopRemoteService','SRManager'); Svcs=@('SplashtopRemoteService*','Splashtop*'); FilePatterns=@('*splashtop*')},
+    @{Key='ZohoAssist'; DisplayNames=@('*Zoho Assist*'); Procs=@('ZohoAssist','ZohoURS','ZohoAssistAgent'); Svcs=@('Zoho Assist*','ZohoAssist*'); FilePatterns=@('*zoho*assist*','*zohoassist*')},
+    @{Key='ChromeRemoteDesktop'; DisplayNames=@('*Chrome Remote Desktop*'); Procs=@('remoting_host','remote_assistance_host'); Svcs=@('chromoting*'); FilePatterns=@('*chrome*remote*desktop*','*chromeremotedesktop*')},
+    @{Key='NetSupportManager'; DisplayNames=@('*NetSupport Manager*','*NetSupport Client*'); Procs=@('client32','pcicfgui','pcideply'); Svcs=@('NetSupport*','NSClient*'); FilePatterns=@('*netsupport*')},
+    @{Key='TacticalRMM'; DisplayNames=@('*Tactical RMM*','*Tactical Agent*'); Procs=@('tacticalrmm','tacticalagent','tacticalagent-v2'); Svcs=@('tacticalrmm*','tacticalagent*'); FilePatterns=@('*tactical*rmm*','*tacticalagent*')},
+    @{Key='MeshCentral'; DisplayNames=@('*Mesh Agent*','*MeshCentral Agent*'); Procs=@('MeshAgent','meshagent64','meshagent'); Svcs=@('Mesh Agent*','MeshAgent*'); FilePatterns=@('*meshagent*','*meshcentral*')},
+    @{Key='RemoteUtilities'; DisplayNames=@('*Remote Utilities*','*Remote Utilities - Host*'); Procs=@('rutserv','rutview','rfusclient','rutserver'); Svcs=@('Remote Utilities*','rutserv*'); FilePatterns=@('*remote*utilities*','*rutserv*')},
+    @{Key='DWService'; DisplayNames=@('*DWService*','*DWAgent*'); Procs=@('dwagent','dwagsvc','dwagentui'); Svcs=@('DWAgent*','DWService*'); FilePatterns=@('*dwagent*','*dwservice*')},
+    @{Key='Supremo'; DisplayNames=@('*Supremo*'); Procs=@('Supremo','SupremoService'); Svcs=@('Supremo*'); FilePatterns=@('*supremo*')},
+    @{Key='AeroAdmin'; DisplayNames=@('*AeroAdmin*'); Procs=@('AeroAdmin'); Svcs=@('AeroAdmin*'); FilePatterns=@('*aeroadmin*')},
+    @{Key='AmmyyAdmin'; DisplayNames=@('*Ammyy Admin*','*Ammyy*'); Procs=@('AA_v3','Ammyy_Admin'); Svcs=@('Ammyy*'); FilePatterns=@('*ammyy*','*aa_v3*')},
+    @{Key='Atera'; DisplayNames=@('*Atera Agent*','*AteraAgent*'); Procs=@('AteraAgent','AteraAgentService','AgentPackageMonitoring'); Svcs=@('AteraAgent*'); FilePatterns=@('*atera*agent*','*ateraagent*')},
+    @{Key='NableTakeControl'; DisplayNames=@('*N-able Take Control*','*Take Control Agent*','*SolarWinds Take Control*'); Procs=@('BASupSrvc','BASupApp','BASupSrvcUpdater','BASupSrvcCnfg','TakeControl'); Svcs=@('BASupportExpressStandaloneService*','Take Control Agent*'); FilePatterns=@('*take*control*agent*','*basupsrvc*')},
+    @{Key='NableRMM'; DisplayNames=@('*N-able N-central*','*N-able N-sight*','*Advanced Monitoring Agent*'); Procs=@('winagent','msp-agent-core','msp-agent'); Svcs=@('Windows Agent Service*','Advanced Monitoring Agent*','N-able*Agent*'); FilePatterns=@('*n-able*n-central*','*n-able*n-sight*','*msp-agent*')},
+    @{Key='SimpleHelp'; DisplayNames=@('*SimpleHelp*'); Procs=@('SimpleService','SimpleHelp'); Svcs=@('SimpleHelp*'); FilePatterns=@('*simplehelp*')},
+    @{Key='BeyondTrustBomgar'; DisplayNames=@('*BeyondTrust Remote Support*','*Bomgar*'); Procs=@('bomgar-scc','bomgar-rep','bomgar-pac'); Svcs=@('Bomgar*','BeyondTrust*Remote*Support*'); FilePatterns=@('*bomgar*','*beyondtrust*remote*support*')},
+    @{Key='Dameware'; DisplayNames=@('*Dameware*','*DameWare*'); Procs=@('DWRCS','DameWare.MiniRemoteControl'); Svcs=@('DameWare Mini Remote Control*','DWRCS*'); FilePatterns=@('*dameware*','*dwrcs*')},
+    @{Key='ISLOnline'; DisplayNames=@('*ISL Online*','*ISL AlwaysOn*','*ISL Light*'); Procs=@('ISLAlwaysOn','ISLLight','ISLClient'); Svcs=@('ISL AlwaysOn*','ISL Online*'); FilePatterns=@('*isl*alwayson*','*isl*light*','*islonline*')},
+    @{Key='RemotePC'; DisplayNames=@('*RemotePC*'); Procs=@('RemotePCService','RemotePCViewer','RemotePCDesktop'); Svcs=@('RemotePC*'); FilePatterns=@('*remotepc*')},
+    @{Key='IperiusRemote'; DisplayNames=@('*Iperius Remote*'); Procs=@('IperiusRemote','IperiusRemoteService'); Svcs=@('Iperius Remote*','IperiusRemote*'); FilePatterns=@('*iperius*remote*')},
+    @{Key='GetScreen'; DisplayNames=@('*Getscreen.me*','*GetScreen*'); Procs=@('getscreen','getscreen-agent'); Svcs=@('Getscreen*','GetScreen*'); FilePatterns=@('*getscreen*')},
+    @{Key='AnyViewer'; DisplayNames=@('*AnyViewer*'); Procs=@('AnyViewer'); Svcs=@('AnyViewer*'); FilePatterns=@('*anyviewer*')},
+    @{Key='Radmin'; DisplayNames=@('*Radmin Server*','*Radmin Viewer*'); Procs=@('r_server','Radmin'); Svcs=@('Radmin Server*'); FilePatterns=@('*radmin*')},
+    @{Key='LiteManager'; DisplayNames=@('*LiteManager*'); Procs=@('ROMServer','ROMViewer'); Svcs=@('ROMService*','LiteManager*'); FilePatterns=@('*litemanager*','*romserver*')},
+    @{Key='NoMachine'; DisplayNames=@('*NoMachine*'); Procs=@('nxserver','nxnode','nxplayer'); Svcs=@('NoMachine*','nxserver*'); FilePatterns=@('*nomachine*')},
+    @{Key='Parsec'; DisplayNames=@('*Parsec*'); Procs=@('parsecd','parsec'); Svcs=@('Parsec*'); FilePatterns=@('*parsec*')},
+    @{Key='Remotely'; DisplayNames=@('*Remotely*'); Procs=@('Remotely_Agent','Remotely_Desktop'); Svcs=@('Remotely*'); FilePatterns=@('*remotely*agent*','*remotely*desktop*')},
+    @{Key='JumpDesktop'; DisplayNames=@('*Jump Desktop Connect*','*Jump Desktop*'); Procs=@('JumpConnect','JumpDesktop'); Svcs=@('Jump Desktop Connect*'); FilePatterns=@('*jump*desktop*')},
+    @{Key='FixMeIT'; DisplayNames=@('*FixMe.IT*','*FixMeIT*'); Procs=@('FixMeIT','Techinline'); Svcs=@('FixMe.IT*','Techinline*'); FilePatterns=@('*fixmeit*','*fixme.it*','*techinline*')},
+    @{Key='KaseyaVSA'; DisplayNames=@('*Kaseya Agent*','*Kaseya VSA*'); Procs=@('AgentMon','KaseyaRemoteControlHost','KaUsrTsk'); Svcs=@('Kaseya Agent*','KaseyaAgent*'); FilePatterns=@('*kaseya*agent*','*agentmon*','*kaseyaremotecontrolhost*')},
+    @{Key='DattoRMM'; DisplayNames=@('*Datto RMM*','*CentraStage*'); Procs=@('CagService','AEMAgent'); Svcs=@('CagService*','Datto RMM*','CentraStage*'); FilePatterns=@('*datto*rmm*','*centrastage*','*cagservice*')},
+    @{Key='NinjaOne'; DisplayNames=@('*NinjaOne*','*NinjaRMM*','*Ninja Remote*'); Procs=@('NinjaRMMAgent','NinjaOneAgent','ncstreamer','ncplayer','QClauncher','QCncstreamer'); Svcs=@('NinjaRMMAgent*','NinjaOne*','NinjaRemote*'); FilePatterns=@('*ninjaone*','*ninjarmm*','*ninja*remote*','*ncstreamer*','*qclauncher*','*qcncstreamer*')},
+    @{Key='Pulseway'; DisplayNames=@('*Pulseway*','*PC Monitor*'); Procs=@('PCMonitorManager','PCMonitorService','Pulseway'); Svcs=@('PC Monitor*','Pulseway*'); FilePatterns=@('*pulseway*','*pcmonitor*')},
+    @{Key='LevelRMM'; DisplayNames=@('*Level RMM*','*Level Agent*'); Procs=@('level-agent','levelagent'); Svcs=@('Level*Agent*'); FilePatterns=@('*level*rmm*','*level*agent*')},
+    @{Key='FleetDeck'; DisplayNames=@('*FleetDeck*'); Procs=@('fleetdeck-agent','FleetDeck'); Svcs=@('FleetDeck*'); FilePatterns=@('*fleetdeck*')},
+    @{Key='Action1'; DisplayNames=@('*Action1 Agent*','*Action1 Connector*'); Procs=@('action1_agent','action1_connector'); Svcs=@('Action1*'); FilePatterns=@('*action1*')},
+    @{Key='ManageEngine'; DisplayNames=@('*ManageEngine Endpoint Central*','*ManageEngine Remote Access Plus*','*Desktop Central Agent*'); Procs=@('dcagentservice','dcagenttrayicon','UEMSAgent'); Svcs=@('ManageEngine*','DesktopCentral*','UEMS*'); FilePatterns=@('*manageengine*','*desktopcentral*','*remote*access*plus*')},
+    @{Key='ConnectWiseAutomate'; DisplayNames=@('*ConnectWise Automate*','*LabTech*'); Procs=@('LTService','LTSvcMon'); Svcs=@('LTService*','LTSvcMon*'); FilePatterns=@('*connectwise*automate*','*labtech*','*ltservice*')},
+    @{Key='ScreenMeet'; DisplayNames=@('*ScreenMeet*'); Procs=@('ScreenMeetSupport','ScreenMeetLive'); Svcs=@('ScreenMeet*'); FilePatterns=@('*screenmeet*')},
+    @{Key='Alpemix'; DisplayNames=@('*Alpemix*'); Procs=@('Alpemix'); Svcs=@('Alpemix*'); FilePatterns=@('*alpemix*')},
+    @{Key='Sunlogin'; DisplayNames=@('*Sunlogin*','*Sunflower Remote Control*'); Procs=@('SunloginClient','SunloginRemote'); Svcs=@('Sunlogin*'); FilePatterns=@('*sunlogin*','*sunflower*remote*control*')},
+    @{Key='ToDesk'; DisplayNames=@('*ToDesk*'); Procs=@('ToDesk','ToDesk_Service'); Svcs=@('ToDesk*'); FilePatterns=@('*todesk*')},
+    @{Key='HopToDesk'; DisplayNames=@('*HopToDesk*'); Procs=@('HopToDesk'); Svcs=@('HopToDesk*'); FilePatterns=@('*hoptodesk*')},
+    @{Key='HelpWire'; DisplayNames=@('*HelpWire*'); Procs=@('HelpWire','HelpWireAgent'); Svcs=@('HelpWire*'); FilePatterns=@('*helpwire*')},
+    @{Key='eHorus'; DisplayNames=@('*eHorus*','*Pandora RC Agent*'); Procs=@('ehorus_agent','PandoraRC'); Svcs=@('eHorus*','Pandora RC*'); FilePatterns=@('*ehorus*','*pandora*rc*')},
+    @{Key='DeskIn'; DisplayNames=@('*DeskIn*'); Procs=@('DeskIn'); Svcs=@('DeskIn*'); FilePatterns=@('*deskin*')},
+    @{Key='TSplusRemoteSupport'; DisplayNames=@('*TSplus Remote Support*'); Procs=@('TSplus-RemoteSupport'); Svcs=@('TSplus Remote Support*'); FilePatterns=@('*tsplus*remote*support*')}
 )
 
 Write-Host "Scanning for remote access tools..." -ForegroundColor Cyan
 $scanResults = @()
+$allServices = @(Get-WmiObject Win32_Service -ErrorAction SilentlyContinue)
+$allProcesses = @(Get-Process -ErrorAction SilentlyContinue)
 
 foreach ($prod in $KnownProducts) {
     $installed = Find-InstalledStrict -patterns $prod.DisplayNames
-    $svc  = Get-WmiObject Win32_Service -ErrorAction SilentlyContinue | Where-Object { $_.Name -in $prod.Svcs }
-    $proc = Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -in $prod.Procs }
+    $svc = @($allServices | Where-Object {
+        (Test-MatchesAnyPattern -Text $_.Name -Patterns $prod.Svcs) -or
+        (Test-MatchesAnyPattern -Text $_.DisplayName -Patterns $prod.Svcs)
+    })
+    $proc = @($allProcesses | Where-Object { $_.ProcessName -in $prod.Procs })
 
     if ($installed -or $proc -or $svc) {
         $scanResults += [pscustomobject]@{
@@ -164,27 +253,32 @@ foreach ($prod in $KnownProducts) {
 
 # --- check for leftover installers ---
 Write-Host "`nChecking for leftover installers..." -ForegroundColor Cyan
+$additionalDriveRoots = @(Get-AdditionalDriveRoots)
 $searchPaths = @(
     "$env:USERPROFILE\Downloads",
     "$env:PUBLIC\Downloads",
     "$env:TEMP",
     "$env:USERPROFILE\Desktop"
-) | Where-Object { Test-Path $_ }
+)
+$searchPaths += $additionalDriveRoots
+$searchPaths = @($searchPaths | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -Unique)
+
+if ($additionalDriveRoots.Count -gt 0) {
+    Write-Host ("Additional drives: {0}" -f ($additionalDriveRoots -join ', ')) -ForegroundColor DarkCyan
+}
 
 $installerHits = @()
+$allFilePatterns = @($KnownProducts | ForEach-Object { $_.FilePatterns } | Select-Object -Unique)
 foreach ($path in $searchPaths) {
-    foreach ($prod in $KnownProducts) {
-        foreach ($name in $prod.DisplayNames) {
-            $found = Get-ChildItem -Path $path -Recurse -ErrorAction SilentlyContinue | Where-Object {
-                $_.Name -like $name -and $_.Extension -match '\.(exe|msi|zip|rar)$'
-            }
-            if ($found) {
-                foreach ($f in $found) {
-                    $installerHits += $f.FullName
-                    Write-Host "[Installer] $($f.Name) — $path" -ForegroundColor Yellow
-                    Log-Scan "Installer found: $($f.FullName)"
-                }
-            }
+    Write-Host "Scanning: $path" -ForegroundColor DarkGray
+    $candidateFiles = Get-ChildItem -Path $path -Recurse -File -ErrorAction SilentlyContinue | Where-Object {
+        $_.Extension -match '\.(exe|msi|msix|msixbundle|appx|appxbundle|zip|rar|7z)$'
+    }
+    foreach ($f in $candidateFiles) {
+        if (Test-MatchesAnyPattern -Text $f.Name -Patterns $allFilePatterns) {
+            $installerHits += $f.FullName
+            Write-Host "[Installer] $($f.Name) - $path" -ForegroundColor Yellow
+            Log-Scan "Installer found: $($f.FullName)"
         }
     }
 }
@@ -200,12 +294,12 @@ $startupHits = @()
 foreach ($folder in $startupPaths) {
     $items = Get-ChildItem -Path $folder -ErrorAction SilentlyContinue
     foreach ($prod in $KnownProducts) {
-        foreach ($name in $prod.DisplayNames) {
+        foreach ($name in $prod.FilePatterns) {
             $match = $items | Where-Object { $_.Name -like $name }
             if ($match) {
                 foreach ($m in $match) {
                     $startupHits += $m.FullName
-                    Write-Host "[Startup] $($m.Name) — $folder" -ForegroundColor Yellow
+                    Write-Host "[Startup] $($m.Name) - $folder" -ForegroundColor Yellow
                     Log-Scan "Startup entry found: $($m.FullName)"
                 }
             }
