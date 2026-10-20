@@ -27,9 +27,24 @@ function Log { param($m,[string]$c="Gray")
 function Open-Select { param($p) if(Test-Path $p){Start-Process explorer.exe "/select,`"$p`""}}
 function Is-SuspiciousPath($p){if(!$p){return $false};$p=$p.ToLower();return($p -match "\\users\\.*\\appdata" -or $p -match "\\downloads" -or $p -match "\\programdata\\" -or $p -match "\\temp\\" -or $p -match "\\roaming")}
 
-$RAKeys=@('screenconnect','connectwise','anydesk','teamviewer','ultraviewer','realvnc','tightvnc','ultravnc',
-'splashtop','zoho assist','ammyy','aero admin','supremo','dwservice','rustdesk','chrome remote desktop','crd')
-$installerExt='exe','msi','zip','rar'
+$RAKeys=@(
+'screenconnect','connectwise control','teamviewer','team remote desktop','anydesk','rustdesk','ultraviewer',
+'logmein','rescue calling card','rescuecallingcard','gotoassist','goto resolve','goto opener',
+'realvnc','tightvnc','ultravnc','tigervnc','vnc server','vnc viewer','splashtop','zoho assist',
+'chrome remote desktop','chromoting','remoting_host','remote_assistance_host','netsupport manager',
+'tactical rmm','tacticalagent','meshagent','meshcentral','remote utilities','rutserv','dwagent','dwservice',
+'supremo','aeroadmin','ammyy','ateraagent','basupsrvc','take control agent','n-able n-central',
+'n-able n-sight','msp-agent-core','simplehelp','bomgar','beyondtrust remote support','dameware',
+'isl alwayson','isl light','remotepc','iperius remote','getscreen','anyviewer','radmin','litemanager',
+'nomachine','parsecd','remotely_agent','jump desktop connect','fixme.it','techinline','agentmon',
+'kaseya remote control','cagservice','datto rmm','centrastage','ninjarmmagent','ninjaoneagent',
+'ninja remote','ncstreamer','ncplayer','qclauncher','qcncstreamer','pulseway','pcmonitorservice',
+'level-agent','levelagent','fleetdeck-agent','action1_agent','action1_connector','desktopcentral',
+'remote access plus','ltservice','ltsvcmon','connectwise automate','screenmeet','alpemix','sunlogin',
+'todesk','hoptodesk','helpwire','ehorus','deskin','tsplus-remotesupport','quick assist','quickassist'
+)
+$RARegex='(?i)('+(($RAKeys|ForEach-Object{[regex]::Escape($_)})-join'|')+')'
+$installerExt='exe','msi','msix','msixbundle','appx','appxbundle','zip','rar','7z'
 $summary=[ordered]@{StartupItems=0;RunKeyHits=0;ServicesSuspicious=0;ServicesDisabledHits=0;SchedTasksSuspicious=0;
 InstallersFound=0;HostsAnomalies=0;FirewallFindings=0;NewAdmins=0;RecentUsers=0;PSAbuseEvents=0;UnsignedDrivers=0;RecentInstalls=0}
 
@@ -126,7 +141,7 @@ if(Test-Path $hosts){
 Log "`n[Firewall]" "Cyan"
 $fw=Get-NetFirewallRule -ErrorAction SilentlyContinue
 if($fw){
- $cand=$fw|Where-Object{$_.Enabled -eq'True' -and ($_.DisplayName -match 'remote|rdp|vnc|anydesk|teamviewer|screenconnect|connectwise|ultraviewer|chrome remote')}
+ $cand=$fw|Where-Object{$_.Enabled -eq'True' -and ($_.DisplayName -match $RARegex -or $_.DisplayName -match '(?i)\brdp\b')}
  if($cand){$cand|ForEach-Object{Log ("Firewall: {0} [{1}/{2}]" -f $_.DisplayName,$_.Direction,$_.Action) "Yellow"};$summary.FirewallFindings=$cand.Count}
  else{Log "No obvious remote rules." "Green"}
 }else{Log "Firewall API unavailable." "DarkGray"}
