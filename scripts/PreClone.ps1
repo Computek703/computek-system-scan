@@ -166,7 +166,7 @@ foreach ($d in $drives) {
     }
 
     Write-Host "Running quick CHKDSK on $drive..." -ForegroundColor Yellow
-    $output = cmd /c "chkdsk $drive" 2>&1
+    $output = cmd /c "chkdsk $drive /scan" 2>&1
 
     if ($output -match 'errors found' -or $output -match 'corrupt') {
         Write-Host "Errors detected on $drive - rerunning with /R..." -ForegroundColor Yellow
